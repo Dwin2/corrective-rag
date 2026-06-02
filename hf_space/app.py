@@ -15,11 +15,29 @@ from groq import RateLimitError
 from prompt import template
 from grader import grader
 from rewrite import rewrite_template
+from research import build_research_agent
 
 PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
 COLLECTION = "hp_films"
 
+# Shared models. Big model only for user-facing answers; cheap model for the
+# internal grade/rewrite/summary steps to conserve the 70b daily token quota.
+big = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=2048)
+small = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=1024)
 
+_embeddings = None
+
+
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return _embeddings
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: corrective RAG over the pre-built Harry Potter index
+# ---------------------------------------------------------------------------
 class Phase3(TypedDict):
     question: str
     documents: list[Document]
@@ -28,17 +46,10 @@ class Phase3(TypedDict):
     count: int
 
 
-def build_agent():
-    # Big model only for the final user-facing answer; cheap model for the
-    # internal grade/rewrite steps to conserve the 70b daily token quota.
-    model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=2048)
-    helper = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=512)
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-    # Load the index that was pre-built and shipped with the Space (see build_index.py).
+def build_query_agent():
     vectorstore = Chroma(
         collection_name=COLLECTION,
-        embedding_function=embeddings,
+        embedding_function=get_embeddings(),
         persist_directory=PERSIST_DIR,
     )
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
@@ -50,20 +61,18 @@ def build_agent():
         context = "\n\n".join(doc.page_content for doc in state["documents"])
         prompt = template.format(context=context, question=state["question"])
         try:
-            return {"answer": model.invoke(prompt).content}
+            return {"answer": big.invoke(prompt).content}
         except RateLimitError:
-            # 70b daily quota exhausted — fall back to the smaller model so the
-            # app still answers (lower quality) instead of erroring out.
-            return {"answer": helper.invoke(prompt).content}
+            return {"answer": small.invoke(prompt).content}
 
     def grade(state):
         context = "\n\n".join(doc.page_content for doc in state["documents"])
         prompt = grader.format(context=context, question=state["question"])
-        return {"relevance": helper.invoke(prompt).content}
+        return {"relevance": small.invoke(prompt).content}
 
     def rewrite(state):
         prompt = rewrite_template.format(question=state["question"])
-        return {"question": helper.invoke(prompt).content, "count": state["count"] + 1}
+        return {"question": small.invoke(prompt).content, "count": state["count"] + 1}
 
     def router(state):
         if state["count"] >= 2:
@@ -85,7 +94,10 @@ def build_agent():
     return build.compile()
 
 
-app = FastAPI(title="Harry Potter Films RAG API")
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Harry Potter RAG + Research API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,21 +106,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_AGENT = None
+_query_agent = None
+_research_run = None
 
 
-def get_agent():
-    # Build lazily on first request so the server binds its port immediately
-    # (HF Spaces health-checks the port; heavy work at import/startup risks a timeout).
-    global _AGENT
-    if _AGENT is None:
-        _AGENT = build_agent()
-    return _AGENT
+def get_query_agent():
+    # Build lazily on first request so the server binds its port immediately.
+    global _query_agent
+    if _query_agent is None:
+        _query_agent = build_query_agent()
+    return _query_agent
+
+
+def get_research_run():
+    global _research_run
+    if _research_run is None:
+        _research_run = build_research_agent(big, small, get_embeddings())
+    return _research_run
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "ready": _AGENT is not None}
+    return {"status": "ok", "query_ready": _query_agent is not None,
+            "research_ready": _research_run is not None}
 
 
 class Query(BaseModel):
@@ -117,10 +137,15 @@ class Query(BaseModel):
 
 @app.post("/query")
 def query(q: Query):
-    result = get_agent().invoke({"question": q.question, "count": 0})
+    result = get_query_agent().invoke({"question": q.question, "count": 0})
     return {
         "answer": result["answer"],
         "final_query": result["question"],
         "relevance": result["relevance"],
         "attempts": result["count"] + 1,
     }
+
+
+@app.post("/research")
+def research(q: Query):
+    return get_research_run()(q.question)

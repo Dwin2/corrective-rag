@@ -9,11 +9,18 @@ from langchain_groq import ChatGroq
 from prompt import template
 from grader import grader
 from rewrite import rewrite_template
+import datetime
 import wikipedia
+from wikipedia import wikipedia as _w
 from dotenv import load_dotenv
 load_dotenv()
 
-wikipedia.set_user_agent("hp-rag-hackathon/1.0 (your-email@example.com)")
+# The old `wikipedia` lib defaults to an http endpoint + a shared User-Agent that
+# Wikimedia now rate-limits (HTTP 429). Use https + a descriptive UA with contact
+# info, and enable polite rate limiting so multi-page loads don't get blocked.
+_w.API_URL = "https://en.wikipedia.org/w/api.php"
+_w.USER_AGENT = "hp-rag-hackathon/1.0 (darwinli@college.harvard.edu)"
+wikipedia.set_rate_limiting(True, min_wait=datetime.timedelta(milliseconds=200))
 
 model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=2048)
 
@@ -41,6 +48,16 @@ titles = [
     "List of Harry Potter characters",
     "Magical objects in Harry Potter",
     "Music of the Harry Potter films",
+
+    # Books — the seven novels plus the series overview
+    "Harry Potter",
+    "Harry Potter and the Philosopher's Stone",
+    "Harry Potter and the Chamber of Secrets",
+    "Harry Potter and the Prisoner of Azkaban",
+    "Harry Potter and the Goblet of Fire",
+    "Harry Potter and the Order of the Phoenix",
+    "Harry Potter and the Half-Blood Prince",
+    "Harry Potter and the Deathly Hallows",
 ]
 
 docs = []
