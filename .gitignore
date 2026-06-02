@@ -1,0 +1,16 @@
+# secrets — never commit
+.env
+*.local
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# node / next / vercel
+node_modules/
+.next/
+.vercel/
+
+# claude
+.claude/settings.local.json
